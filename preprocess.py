@@ -1,4 +1,4 @@
-iimport os
+import os
 from transformers import AutoTokenizer
 import nltk.data
 
@@ -8,19 +8,23 @@ import nltk.data
 
 
 class Preprocesser:
-    def __init__(self, tokenizer_, sent_tokenizer_, rel_ids_, max_input=1024, count_special=False):
+    def __init__(self, tokenizer_, sent_tokenizer_, rel_ids_, max_input=1024, count_special=False,
+                 count_intersected=True, add_last_ch=False):
         self.tokenizer = tokenizer_
         self.tmp_croped = 0
         self.tmp_not_croped = 0
         self.max_input = max_input
         self.count_special = count_special
+        self.count_intersected = count_intersected
         self.sent_tokenizer = sent_tokenizer_
+        self.add_last_ch = add_last_ch  # count last * for evids
         # --- statistics
         self.rels_in_directory = 0
         self.rels_in_document = 0
         self.rels_found_in_directory = 0
         self.rels_found_in_document = 0
         self.rels_start_count_flag = True
+
         self.ents = 0
         self.ents_found = 0
         self.rel_ids = rel_ids_
@@ -69,30 +73,49 @@ class Preprocesser:
         return tokens_iter, digit_iter
 
     def proc_sent(self, sents_list, cur_sent_id, evids_list, cur_evid_id, offset):
+        # [*, ev, ##id]
         """evids_list: [(name, beg, end, ann_id)]"""
         evids_in_sent = []
+        running_evids = {}
         token_iter = 0
         cur_sent = sents_list[cur_sent_id]
         cur_sent_tokens = self.tokenizer.tokenize(cur_sent)
-        evid_started_flag = False
-        evid_beg = 0
-
-        while cur_evid_id < len(evids_list) and token_iter < len(cur_sent_tokens)-1:
-            if cur_sent_tokens[token_iter] == '^' and not evid_started_flag:
-                cur_sent_tokens[token_iter] = '*'
-                evid_started_flag = True
-                evid_beg = token_iter
-                while '^' not in cur_sent_tokens[token_iter+1:]:
+        while True:
+            if cur_sent_tokens[token_iter] == '^' and token_iter != 0 and cur_sent_tokens[token_iter-1] == '^':
+                cur_sent_tokens.pop(token_iter-1)
+                token_iter -= 1
+            elif cur_sent_tokens[token_iter] == '@' and token_iter != 0 and cur_sent_tokens[token_iter - 1] == '@':
+                cur_sent_tokens.pop(token_iter - 1)
+                token_iter -= 1
+            elif cur_sent_tokens[token_iter] == '@' or cur_sent_tokens[token_iter] == '^':
+                digs = ''
+                while True:
+                    digs += cur_sent_tokens[token_iter+1]
+                    cur_sent_tokens.pop(token_iter+1)
+                    if len(cur_sent_tokens) == token_iter+1: #
+                        a = 1
+                    if cur_sent_tokens[token_iter+1] == '^' or cur_sent_tokens[token_iter+1] == '@':
+                        cur_sent_tokens.pop(token_iter + 1)
+                        break
+                evid_id = int(digs)
+                if evid_id in running_evids:
+                    evid_beg = running_evids[evid_id]
+                    evids_in_sent.append([evids_list[cur_evid_id][0], offset+evid_beg,
+                                      offset+token_iter, evids_list[cur_evid_id][-1]])
+                    cur_evid_id += 1
+                    running_evids.pop(evid_id)
+                else:
+                    running_evids[evid_id] = token_iter
+                token_iter += 1
+            else:
+                token_iter += 1
+                if token_iter >= len(cur_sent_tokens)-1 and len(running_evids) != 0:
                     cur_sent_id += 1
                     cur_sent_tokens += self.tokenizer.tokenize(sents_list[cur_sent_id])
-            elif cur_sent_tokens[token_iter] == '^':
-                cur_sent_tokens[token_iter] = '*'
-                evids_in_sent.append((evids_list[cur_evid_id][0], offset+evid_beg,
-                                      offset+token_iter, evids_list[cur_evid_id][-1]))
-                cur_evid_id += 1
-                evid_started_flag = False
-            token_iter += 1
+                elif token_iter >= len(cur_sent_tokens)-1 or cur_evid_id >= len(evids_list):
+                    break
 
+        cur_sent_tokens = ['*' if (i == '^' or i == '@') else i for i in cur_sent_tokens]
         return cur_sent_id, cur_evid_id, evids_in_sent, cur_sent_tokens
 
     @staticmethod
@@ -101,6 +124,7 @@ class Preprocesser:
         evid_list = sorted(evid_list, key=lambda x: (x[1], -x[2]))
         not_intersected = []
         prev_beg, prev_end = -1, -1
+        # todo - check system flag
         for evid in evid_list:
             cur_beg, cur_end = evid[1], evid[2]
             if cur_beg > prev_end:
@@ -113,19 +137,27 @@ class Preprocesser:
 
     @staticmethod
     def insert_boarders(text, evid_list):
-        for evid in evid_list[::-1]:
+        boarders_list = []
+        for evid_num, evid in enumerate(evid_list[::-1]):
             beg, end = evid[1], evid[2]
             if end == len(text):
                 end -= 1
             elif text[end].isalpha():
                 end += 1
-            text = text[:end] + '^' + text[end:]
-            text = text[:beg] + '^' + text[beg:]
+            boarders_list.append((end, evid_num, '@'))
+            boarders_list.append((beg, evid_num, '^'))
+
+        boarders_list.sort(key=lambda x: -x[0])
+
+        for (pos, ent_id, c) in boarders_list:
+            text = text[:pos] + c + str(ent_id) + c + text[pos:]
         return text
 
     def split_txt_to_fragments(self, text, evids):
         """splits text in fragments of length < max_input"""
-        allowed_evids_list = self.select_not_intersected_evids(evids)
+
+        allowed_evids_list = sorted(evids, key=lambda x: (x[1], x[2])) if \
+            self.count_intersected else self.select_not_intersected_evids(evids)
 
         text = self.insert_boarders(text, allowed_evids_list)
         sents = self.sent_tokenizer.tokenize(text)
@@ -143,7 +175,6 @@ class Preprocesser:
             tokens = self.tokenizer.convert_tokens_to_ids(tokens)
 
             if len(tokens_in_fragments[cur_fragment_id]) + len(tokens) >= self.max_input-2:
-
                 cur_fragment_id += 1
                 converted_evids_in_fragments.append([])
                 if self.count_special:
@@ -214,7 +245,7 @@ class Preprocesser:
             else:
                 self.add_to_dict(ents_dict, ent_id, evid)
                 ann_id_to_ent_id[ann_id] = ent_id
-                evid_name_to_ent_id[name] = ent_id
+                evid_name_to_ent_id[name] = ent_id 
         return ents_dict
 
     def generate_ents_combinations(self, ents, rels):
@@ -292,7 +323,7 @@ class Preprocesser:
                 rec_parts = line.strip().split("\t")
                 assert rec_parts[0] == text_num
                 if rec_parts[1].isdigit():
-                    ann_lines.append(self.on_ents_line_pub_tator(rec_parts, alias_dict))
+                    ann_lines += self.on_ents_line_pub_tator(rec_parts)
                 elif rec_parts[1].isalpha():
                     ann_lines.append(self.on_rels_line_pub_tator(rec_parts, alias_dict, n_rels))
                     n_rels += 1
@@ -301,18 +332,17 @@ class Preprocesser:
         return text, ann_lines
 
     @staticmethod
-    def on_ents_line_pub_tator(line_parts, alias_dict):
+    def on_ents_line_pub_tator(line_parts):
         ent_start, ent_end, name, ent_type, ent_id = line_parts[1], line_parts[2], line_parts[3], line_parts[4], \
                                                      line_parts[5]
-        ent_id = 'T'+ent_id
+
         id_parts = ent_id.split('|')
-        if len(id_parts) > 1:
-            main_id = id_parts[0]
-            for alias in id_parts[1:]:
-                alias_dict[alias] = main_id
-            ent_id = main_id
         pos = " ".join([ent_type, ent_start, ent_end])
-        return "\t".join([ent_id, pos, name])
+        res = []
+        for i in range(len(id_parts)):
+            cur_id = 'T' + id_parts[i]
+            res.append("\t".join([cur_id, pos, name]))
+        return res
 
     @staticmethod
     def on_rels_line_pub_tator(line_parts, alias_dict, n_rels):
@@ -381,10 +411,12 @@ class Preprocesser:
 
 if __name__ == '__main__':
     nltk.download('punkt')
-    rel_ids = {"Body_location_rel": 0, "Severity_rel": 1, "Course_rel": 2, "Modificator_rel": 3,
-               "Symptom_bdyloc_rel": 4}
+    #rel_ids = {"Body_location_rel": 0, "Severity_rel": 1, "Course_rel": 2, "Modificator_rel": 3,
+    #           "Symptom_bdyloc_rel": 4}
+    rel_ids = {"CID": 0}
     tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
     sent_tokenizer = nltk.data.load('tokenizers/punkt/russian.pickle')
-    prepr = Preprocesser(tokenizer, sent_tokenizer)
-    res = prepr.proc_bart_dir("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/all")
-    #res = prepr.proc_pub_tator_file("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/cdr_dataset/CDR_dev.txt")
+    prepr = Preprocesser(tokenizer, sent_tokenizer, rel_ids)
+    #res = prepr.proc_bart_dir("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/all")
+    res = prepr.proc_pub_tator_file("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/cdr_dataset/CDR_dev.txt")
+
