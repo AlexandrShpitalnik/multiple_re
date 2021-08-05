@@ -2,13 +2,12 @@ import os
 from transformers import AutoTokenizer
 import nltk.data
 
-# todo - general statistics for entities in files
+# todo - distinkt logger
 # todo - add rel_ids
-# todo - statistics found rels
 
 
 class Preprocesser:
-    def __init__(self, tokenizer_, sent_tokenizer_, rel_ids_, max_input=1024, count_special=False,
+    def __init__(self, tokenizer_, sent_tokenizer_, rel_ids_, max_input=512, count_special=False,
                  count_intersected=True, add_last_ch=False):
         self.tokenizer = tokenizer_
         self.tmp_croped = 0
@@ -18,6 +17,7 @@ class Preprocesser:
         self.count_intersected = count_intersected
         self.sent_tokenizer = sent_tokenizer_
         self.add_last_ch = add_last_ch  # count last * for evids
+
         # --- statistics
         self.rels_in_directory = 0
         self.rels_in_document = 0
@@ -28,6 +28,8 @@ class Preprocesser:
         self.ents = 0
         self.ents_found = 0
         self.rel_ids = rel_ids_
+
+        self.not_counted_rels = 0
         #self.rel_ids = {"Body_location_rel": 0, "Severity_rel": 1, "Course_rel": 2, "Modificator_rel": 3,
         #       "Symptom_bdyloc_rel": 4}
         #self.rel_ids = {"CID": 0}
@@ -72,7 +74,8 @@ class Preprocesser:
             tokens_iter += 1
         return tokens_iter, digit_iter
 
-    def proc_sent(self, sents_list, cur_sent_id, evids_list, cur_evid_id, offset):
+    def proc_sent(self, sents_list, cur_sent_id, evids_list, cur_evid_id):
+        # todo - count original evids
         # [*, ev, ##id]
         """evids_list: [(name, beg, end, ann_id)]"""
         evids_in_sent = []
@@ -92,16 +95,14 @@ class Preprocesser:
                 while True:
                     digs += cur_sent_tokens[token_iter+1]
                     cur_sent_tokens.pop(token_iter+1)
-                    if len(cur_sent_tokens) == token_iter+1: #
-                        a = 1
                     if cur_sent_tokens[token_iter+1] == '^' or cur_sent_tokens[token_iter+1] == '@':
                         cur_sent_tokens.pop(token_iter + 1)
                         break
                 evid_id = int(digs)
                 if evid_id in running_evids:
                     evid_beg = running_evids[evid_id]
-                    evids_in_sent.append([evids_list[cur_evid_id][0], offset+evid_beg,
-                                      offset+token_iter, evids_list[cur_evid_id][-1]])
+                    evids_in_sent.append([evids_list[cur_evid_id][0], evid_beg,
+                                      token_iter, evids_list[cur_evid_id][-1]])
                     cur_evid_id += 1
                     running_evids.pop(evid_id)
                 else:
@@ -116,6 +117,7 @@ class Preprocesser:
                     break
 
         cur_sent_tokens = ['*' if (i == '^' or i == '@') else i for i in cur_sent_tokens]
+        cur_sent_id += 1
         return cur_sent_id, cur_evid_id, evids_in_sent, cur_sent_tokens
 
     @staticmethod
@@ -155,6 +157,7 @@ class Preprocesser:
 
     def split_txt_to_fragments(self, text, evids):
         """splits text in fragments of length < max_input"""
+        #todo - global char offset for logging
 
         allowed_evids_list = sorted(evids, key=lambda x: (x[1], x[2])) if \
             self.count_intersected else self.select_not_intersected_evids(evids)
@@ -171,7 +174,7 @@ class Preprocesser:
 
         while cur_sent_id < len(sents):
             cur_sent_id, cur_evid_id, evids_in_sent, tokens = \
-                self.proc_sent(sents, cur_sent_id, allowed_evids_list, cur_evid_id, offset_for_tokens_in_fragments)
+                self.proc_sent(sents, cur_sent_id, allowed_evids_list, cur_evid_id)
             tokens = self.tokenizer.convert_tokens_to_ids(tokens)
 
             if len(tokens_in_fragments[cur_fragment_id]) + len(tokens) >= self.max_input-2:
@@ -185,10 +188,13 @@ class Preprocesser:
                     tokens_in_fragments.append([])
                     offset_for_tokens_in_fragments = 0
 
+            for evid in evids_in_sent:
+                evid[1] += offset_for_tokens_in_fragments
+                evid[2] += offset_for_tokens_in_fragments
+
             tokens_in_fragments[cur_fragment_id] += tokens
             converted_evids_in_fragments[-1] += evids_in_sent
             offset_for_tokens_in_fragments += len(tokens)
-            cur_sent_id += 1
         return tokens_in_fragments, converted_evids_in_fragments
 
     @staticmethod
@@ -245,7 +251,7 @@ class Preprocesser:
             else:
                 self.add_to_dict(ents_dict, ent_id, evid)
                 ann_id_to_ent_id[ann_id] = ent_id
-                evid_name_to_ent_id[name] = ent_id 
+                evid_name_to_ent_id[name] = ent_id
         return ents_dict
 
     def generate_ents_combinations(self, ents, rels):
@@ -280,7 +286,7 @@ class Preprocesser:
             i = 10
         return hts, labels
 
-    def proc_fragment(self, ann_input, evids):
+    def proc_fragment(self, ann_input, evids, rels_in_doc_set):
         # idxs_names_map = {}  # ent id (T_N) <-> name
         # ents = {}  # name -> number (to convert to idxs)
         rels = {}  # {evid1 : [(evid2, type)]}
@@ -291,6 +297,8 @@ class Preprocesser:
             line = line.strip()
 
             if line[0] == "R":
+                if line in rels_in_doc_set:
+                    rels_in_doc_set.remove(line)
                 if self.rels_start_count_flag:
                     self.rels_in_document += 1
                 self.on_rel_line_bart(line, rels)
@@ -333,8 +341,9 @@ class Preprocesser:
 
     @staticmethod
     def on_ents_line_pub_tator(line_parts):
-        ent_start, ent_end, name, ent_type, ent_id = line_parts[1], line_parts[2], line_parts[3], line_parts[4], \
-                                                     line_parts[5]
+        ent_start, ent_end = str(min(int(line_parts[1]), int(line_parts[2]))), \
+                             str(max(int(line_parts[1]), int(line_parts[2])))
+        name, ent_type, ent_id = line_parts[3], line_parts[4], line_parts[5]
 
         id_parts = ent_id.split('|')
         pos = " ".join([ent_type, ent_start, ent_end])
@@ -367,16 +376,19 @@ class Preprocesser:
         self.rels_start_count_flag = True
         self.rels_in_document = 0
         self.rels_found_in_document = 0
-        # todo - ents
+        # count not found rels
+
+        rels_in_doc_set = set([line for line in ann_input if line.startswith("R")])
 
         for fragment_id in range(len(tokens_in_fragments)):
             tokens = tokens_in_fragments[fragment_id]
             evids = evids_in_fragments[fragment_id]
-            evids_pos, hts, labels = self.proc_fragment(ann_input, evids)
+
+            evids_pos, hts, labels = self.proc_fragment(ann_input, evids, rels_in_doc_set)
             if len(hts) > 0:
                 res.append({'input_ids': tokens, 'entity_pos': evids_pos, 'hts': hts, 'labels': labels})
 
-        # print('r', self.rels_in_document, self.rels_found_in_document, len(tokens_in_fragments))
+        self.not_counted_rels += len(rels_in_doc_set)
         self.rels_in_directory += self.rels_in_document
         self.rels_found_in_directory += self.rels_found_in_document
         return res
@@ -389,7 +401,6 @@ class Preprocesser:
             doc_id = file_name[:-4]
             documents.add(doc_id)
         for doc in documents:
-            print(doc)
             txt, ann = doc + '.txt', doc + '.ann'
             txt_file, ann_file = open(w_dir + '/' + txt), open(w_dir + '/' + ann)
             text_input, ann_input = txt_file.read(), [line.strip() for line in ann_file]
@@ -418,5 +429,4 @@ if __name__ == '__main__':
     sent_tokenizer = nltk.data.load('tokenizers/punkt/russian.pickle')
     prepr = Preprocesser(tokenizer, sent_tokenizer, rel_ids)
     #res = prepr.proc_bart_dir("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/all")
-    res = prepr.proc_pub_tator_file("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/cdr_dataset/CDR_dev.txt")
-
+    res = prepr.proc_pub_tator_file("/home/a-shp/Documents/MSU/курсовая/Bert_for_cls/cdr_dataset/CDR_test.txt")
